@@ -87,6 +87,9 @@ def calc_cost(model_name, input_tokens, output_tokens):
         return 0
     elif 'qwen' in model_name.lower():
         return 0
+    elif model_name not in MODEL_COST_PER_INPUT or model_name not in MODEL_COST_PER_OUTPUT:
+        logger.warning("No cost table entry for model %s; recording cost as 0.", model_name)
+        return 0
     
     cost = (
         MODEL_COST_PER_INPUT[model_name] * input_tokens

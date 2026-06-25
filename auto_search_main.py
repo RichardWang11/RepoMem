@@ -51,7 +51,20 @@ from util.runtime.fn_call_converter import (
 # os.environ['LITELLM_LOG'] = 'DEBUG
 
 
-def filter_dataset(dataset, filter_column: str, used_list: str):
+def filter_dataset(dataset, filter_column: str, used_list: str, used_list_file: str = None):
+    if used_list_file:
+        with open(used_list_file, 'r') as file:
+            selected_ids = json.load(file)
+        selected_ids = set(selected_ids)
+        logging.info(f'Filtering {len(selected_ids)} tasks from "{used_list_file}"...')
+
+        def filter_function(example):
+            return example[filter_column] in selected_ids
+
+        filtered_dataset = dataset.filter(filter_function)
+        logging.info(f'Retained {len(filtered_dataset)} tasks after filtering')
+        return filtered_dataset
+
     file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.toml')
     if os.path.exists(file_path):
         with open(file_path, 'r') as file:
@@ -117,6 +130,7 @@ def auto_search_process(result_queue,
                         traj_data=None,
                         temp=1.0,
                         max_iteration_num=20,
+                        request_timeout=120,
                         use_function_calling=True):
     if tools and ('hosted_vllm' in model_name or 'qwen' in model_name.lower() 
     #             #   or model_name=='azure/gpt-4o' 
@@ -125,7 +139,7 @@ def auto_search_process(result_queue,
         use_function_calling = False
         
     # for LLM which do not support function calling
-    if not use_function_calling:
+    if tools and not use_function_calling:
         # 转换message
         messages = convert_fncall_messages_to_non_fncall_messages(messages, tools, add_in_context_learning_example=False)
             
@@ -164,6 +178,7 @@ def auto_search_process(result_queue,
                     model=model_name,
                     temperature=temp, top_p=0.8, repetition_penalty=1.05, 
                     messages=messages,
+                    request_timeout=request_timeout,
                     stop=NON_FNCALL_STOP_WORDS
                 )
             elif tools:
@@ -172,6 +187,7 @@ def auto_search_process(result_queue,
                     tools=tools,
                     messages=messages,
                     temperature=temp,
+                    request_timeout=request_timeout,
                     # stop=['</execute_ipython>'], #</finish>',
                 )
             else:
@@ -179,11 +195,15 @@ def auto_search_process(result_queue,
                     model=model_name,
                     messages=messages,
                     temperature=temp,
+                    request_timeout=request_timeout,
                     stop=['</execute_ipython>'], #</finish>',
                 )
         except litellm.BadRequestError as e:
             # If there's an error, send the error info back to the parent process
             result_queue.put({'error': str(e), 'type': 'BadRequestError'})
+            return
+        except Exception as e:
+            result_queue.put({'error': str(e), 'type': e.__class__.__name__})
             return
         
         if last_message and response.choices[0].message.content == last_message:
@@ -229,6 +249,14 @@ def auto_search_process(result_queue,
         actions = parser.parse(response)
         if not isinstance(actions, List):
             actions = [actions]
+        if (
+            cur_interation_num >= max_iteration_num
+            and not any(action.action_type == ActionType.FINISH for action in actions)
+        ):
+            final_output = response.choices[0].message.content or ''
+            logging.info("Maximum iterations reached; using the latest response as final output.")
+            finish = True
+            continue
         for action in actions:
             logging.debug(action.action_type)
             if action.action_type == ActionType.FINISH:
@@ -246,12 +274,15 @@ def auto_search_process(result_queue,
                 ipython_code = action.code.strip('`')
                 logging.info(f"Executing code:\n```\n{ipython_code}\n```")
                 function_response = execute_ipython(ipython_code)
-                try:
-                    function_response = eval(function_response)
-                except SyntaxError:
-                    function_response = function_response
-                if not isinstance(function_response, str):
-                    function_response = str(function_response)
+                if function_response is None:
+                    function_response = ''
+                else:
+                    try:
+                        function_response = eval(function_response)
+                    except (SyntaxError, TypeError):
+                        function_response = function_response
+                    if not isinstance(function_response, str):
+                        function_response = str(function_response)
                 
                 logging.info("OBSERVATION:\n" + function_response)
                 if not tools:
@@ -377,6 +408,8 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
                         'fake_user_msg': auto_search.FAKE_USER_MSG_FOR_LOC,
                         'temp': 1,
                         'tools': tools,
+                        'max_iteration_num': args.max_iteration_num,
+                        'request_timeout': args.request_timeout,
                         'use_function_calling': args.use_function_calling,
                     })
                     process.start()
@@ -389,10 +422,19 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
                         raise TimeoutError
                     
                     # loc_result, messages, traj_data = result_queue.get()
-                    result = result_queue.get()
+                    try:
+                        result = result_queue.get_nowait()
+                    except Empty:
+                        logger.warning(f"{instance_id} attempt {max_attempt_num} returned no result. Try again.")
+                        max_attempt_num = max_attempt_num - 1
+                        continue
                     if isinstance(result, dict) and 'error' in result and result['type'] == 'BadRequestError':
                         raise litellm.BadRequestError(result['error'], args.model, args.model.split('/')[0])
                         # print(f"Error occurred in subprocess: {result['error']}")
+                    elif isinstance(result, dict) and 'error' in result:
+                        logger.warning(f"{result['type']}: {result['error']}. Try again.")
+                        max_attempt_num = max_attempt_num - 1
+                        continue
                     else:
                         loc_result, messages, traj_data = result
                         
@@ -484,7 +526,7 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
 
 def localize(args):
     bench_data = load_dataset(args.dataset, split=args.split)
-    bench_tests = filter_dataset(bench_data, 'instance_id', args.used_list)
+    bench_tests = filter_dataset(bench_data, 'instance_id', args.used_list, args.used_list_file)
     if args.eval_n_limit:
         eval_n_limit = min(args.eval_n_limit, len(bench_tests))
         bench_tests = bench_tests.select(range(0, eval_n_limit))
@@ -587,6 +629,8 @@ def main():
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--eval_n_limit", type=int, default=0)
     parser.add_argument("--used_list", type=str, default='selected_ids')
+    parser.add_argument("--used_list_file", type=str, default=None,
+                        help="Path to a JSON list of instance IDs to run.")
     
     parser.add_argument("--output_folder", type=str, required=True)
     parser.add_argument("--output_file", type=str, default="loc_outputs.jsonl")
@@ -595,14 +639,6 @@ def main():
     parser.add_argument(
         "--model", type=str,
         default="openai/gpt-4o-2024-05-13",
-        choices=["gpt-4o", 
-                 "azure/gpt-4o", "openai/gpt-4o-2024-05-13",
-                 "deepseek/deepseek-chat", "deepseek-ai/DeepSeek-R1",
-                 "litellm_proxy/claude-3-5-sonnet-20241022", "litellm_proxy/gpt-4o-2024-05-13", "litellm_proxy/o3-mini-2025-01-31",
-                 # fine-tuned model
-                 "openai/qwen-7B", "openai/qwen-7B-128k", "openai/ft-qwen-7B", "openai/ft-qwen-7B-128k",
-                 "openai/qwen-32B", "openai/qwen-32B-128k", "openai/ft-qwen-32B", "openai/ft-qwen-32B-128k",
-        ]
     )
     parser.add_argument("--use_function_calling", action="store_true",
                         help='Enable function calling features of LLMs. If disabled, codeact will be used to support function calling.')
@@ -616,6 +652,8 @@ def main():
     
     parser.add_argument("--log_level", type=str, default='INFO')
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--request_timeout", type=int, default=120)
+    parser.add_argument("--max_iteration_num", type=int, default=20)
     parser.add_argument("--rerun_empty_location", action="store_true")
     args = parser.parse_args()
 
