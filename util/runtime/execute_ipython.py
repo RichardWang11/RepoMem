@@ -4,6 +4,8 @@ from plugins.location_tools.repo_ops.repo_ops import (
     get_entity_contents,
     explore_graph_structure,
     explore_tree_structure,
+    search_commit,
+    examine_commit,
 )
 
 from IPython.utils.capture import capture_output
@@ -19,6 +21,8 @@ def execute_ipython(code_to_execute):
     ipython_shell.user_ns['get_entity_contents'] = get_entity_contents
     ipython_shell.user_ns['explore_graph_structure'] = explore_graph_structure
     ipython_shell.user_ns['explore_tree_structure'] = explore_tree_structure
+    ipython_shell.user_ns['search_commit'] = search_commit
+    ipython_shell.user_ns['examine_commit'] = examine_commit
     # ipython_shell.user_ns['explore_repo_structure'] = explore_repo_structure
     # ipython_shell.user_ns['search_interactions_among_modules'] = search_interactions_among_modules
 

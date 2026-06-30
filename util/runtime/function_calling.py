@@ -18,10 +18,17 @@ from util.actions.action import (
 from .finish import FinishTool
 from .structure_tools import ExploreTreeStructure, ExploreTreeStructure_simple
 from .content_tools import SearchEntityTool, SearchRepoTool
+from .memory_tools import SearchCommitTool, ExamineCommitTool
 import logging
 logger = logging.getLogger()
 
-ALL_FUNCTIONS = ['explore_tree_structure', 'search_code_snippets', 'get_entity_contents']
+ALL_FUNCTIONS = [
+    'explore_tree_structure',
+    'search_code_snippets',
+    'get_entity_contents',
+    'search_commit',
+    'examine_commit',
+]
 
 SYSTEM_PROMPT = """You are a helpful assistant that can interact with a computer to solve tasks.
 <IMPORTANT>
@@ -96,6 +103,7 @@ def get_tools(
         codeact_enable_search_keyword: bool = False,
         codeact_enable_search_entity: bool = False,
         codeact_enable_tree_structure_traverser: bool = False,
+        codeact_enable_repomem_episodic: bool = False,
         simple_desc: bool = False,
         
 ) -> list[ChatCompletionToolParam]:
@@ -111,6 +119,8 @@ def get_tools(
             tools.append(ExploreTreeStructure_simple)
         else:
             tools.append(ExploreTreeStructure)
+    if codeact_enable_repomem_episodic:
+        tools.append(SearchCommitTool)
+        tools.append(ExamineCommitTool)
     return tools
-
 

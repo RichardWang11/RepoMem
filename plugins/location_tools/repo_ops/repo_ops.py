@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from typing import List, Optional
 import collections
+import math
 from copy import deepcopy
 import uuid
 import networkx as nx
@@ -51,6 +52,296 @@ DP_GRAPH_DEPENDENCY_SEARCHER: RepoDependencySearcher | None = None
 DP_GRAPH: nx.MultiDiGraph | None = None
 
 REPO_SAVE_DIR: str | None = None
+REPOMEM_CACHE: dict = {}
+
+
+def _repomem_repo_key(repo_name: str) -> str:
+    return repo_name.replace("/", "__")
+
+
+def _repomem_tokenize(text: str):
+    tokenizer = os.environ.get("REPOMEM_TOKENIZER", "code").lower()
+    if tokenizer == "whitespace":
+        return [tok.lower() for tok in text.split() if tok.strip()]
+
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+", text)
+    tokens = []
+    for raw in raw_tokens:
+        pieces = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").split()
+        tokens.append(raw.lower())
+        tokens.extend(piece.lower() for piece in pieces if piece)
+    return tokens
+
+
+def _repomem_leakage_filter_enabled():
+    return os.environ.get("REPOMEM_LEAKAGE_FILTER", "1").lower() not in ("0", "false", "no")
+
+
+def _repomem_commit_window_size():
+    value = os.environ.get("REPOMEM_COMMIT_WINDOW", "7000")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 7000
+
+
+def _repomem_patch_max_chars():
+    value = os.environ.get("REPOMEM_PATCH_MAX_CHARS", "12000")
+    try:
+        return max(1000, int(value))
+    except ValueError:
+        return 12000
+
+
+def _get_repomem_index_dir():
+    index_dir = os.environ.get("REPOMEM_INDEX_DIR")
+    if not index_dir:
+        return None
+    return index_dir
+
+
+def _load_repomem_repo(repo_name: str):
+    index_dir = _get_repomem_index_dir()
+    if not index_dir:
+        return None
+
+    cache_key = (index_dir, repo_name)
+    if cache_key in REPOMEM_CACHE:
+        return REPOMEM_CACHE[cache_key]
+
+    repo_dir = os.path.join(index_dir, _repomem_repo_key(repo_name))
+    commits_path = os.path.join(repo_dir, "commits.jsonl")
+    issues_path = os.path.join(repo_dir, "issues.jsonl")
+    meta_path = os.path.join(repo_dir, "meta.json")
+    if not os.path.exists(commits_path) or not os.path.exists(meta_path):
+        return None
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    issues = {}
+    if os.path.exists(issues_path):
+        for line in open(issues_path, encoding="utf-8"):
+            row = json.loads(line)
+            number = str(row.get("issue_number", "")).strip()
+            if number:
+                issues[number] = row
+
+    commits = []
+    for line in open(commits_path, encoding="utf-8"):
+        row = json.loads(line)
+        text = " ".join([row.get("subject", ""), row.get("message", "")])
+        tokens = _repomem_tokenize(text)
+        row["_tokens"] = tokens
+        row["_token_counts"] = collections.Counter(tokens)
+        row["_doc_len"] = len(tokens)
+        commits.append(row)
+
+    data = {
+        "meta": meta,
+        "commits": commits,
+        "issues": issues,
+        "index_repo_dir": repo_dir,
+        "_leakage_cache": {},
+    }
+    REPOMEM_CACHE[cache_key] = data
+    return data
+
+
+def _current_base_history_index(memory_data):
+    if not CURRENT_INSTANCE:
+        return None
+    base_commit = CURRENT_INSTANCE.get("base_commit")
+    if not base_commit:
+        return None
+    sha_map = memory_data["meta"].get("sha_to_history_index", {})
+    if base_commit in sha_map:
+        return sha_map[base_commit]
+    matches = [idx for sha, idx in sha_map.items() if sha.startswith(base_commit) or base_commit.startswith(sha)]
+    return matches[0] if matches else None
+
+
+def _iter_visible_commits(memory_data):
+    base_idx = _current_base_history_index(memory_data)
+    commits = memory_data["commits"]
+    if base_idx is None:
+        visible = commits[-_repomem_commit_window_size():]
+    else:
+        visible = [
+            row for row in commits
+            if base_idx - _repomem_commit_window_size() <= row.get("history_index", -1) < base_idx
+        ]
+    excluded_shas, _ = _current_leakage_exclusions(memory_data)
+    if excluded_shas:
+        visible = [row for row in visible if row.get("sha") not in excluded_shas]
+    yield from visible
+
+
+def _current_problem_text():
+    if not CURRENT_INSTANCE:
+        return ""
+    return CURRENT_INSTANCE.get("problem_statement") or ""
+
+
+def _repomem_overlap_tokens(text):
+    return [
+        tok for tok in _repomem_tokenize(text)
+        if len(tok) >= 3 and not tok.isdigit()
+    ]
+
+
+def _repomem_ngrams(tokens, n=5):
+    if len(tokens) < n:
+        return set()
+    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _longest_common_token_run(a, b):
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for atok in a:
+        cur = [0] * (len(b) + 1)
+        for j, btok in enumerate(b, start=1):
+            if atok == btok:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+def _issue_overlaps_current(issue_row, problem_tokens, problem_ngrams, problem_text):
+    number = str(issue_row.get("issue_number", "")).strip()
+    if number and re.search(rf"(?<!\d)#{re.escape(number)}(?!\d)", problem_text):
+        return True, {"method": "issue_number", "score": 1.0}
+    if number and len(number) >= 5 and re.search(rf"(?<!\d){re.escape(number)}(?!\d)", problem_text):
+        return True, {"method": "bare_issue_number", "score": 1.0}
+
+    issue_text = " ".join([
+        issue_row.get("issue_summary", "") or "",
+        issue_row.get("issue_description", "") or "",
+    ])
+    issue_tokens = _repomem_overlap_tokens(issue_text)
+    if not issue_tokens:
+        return False, {"method": "missing_issue_text", "score": 0.0}
+
+    ngram_threshold = float(os.environ.get("REPOMEM_LEAKAGE_NGRAM_THRESHOLD", "0.20"))
+    span_threshold = int(os.environ.get("REPOMEM_LEAKAGE_SPAN_THRESHOLD", "80"))
+    issue_ngrams = _repomem_ngrams(issue_tokens)
+    if issue_ngrams and problem_ngrams:
+        inter = len(issue_ngrams & problem_ngrams)
+        union = len(issue_ngrams | problem_ngrams)
+        jaccard = inter / union if union else 0.0
+        if jaccard >= ngram_threshold:
+            return True, {"method": "ngram_jaccard", "score": jaccard}
+
+    span = _longest_common_token_run(problem_tokens, issue_tokens)
+    if span >= span_threshold:
+        return True, {"method": "common_token_span", "score": span}
+
+    return False, {"method": "none", "score": 0.0}
+
+
+def _current_leakage_exclusions(memory_data):
+    if not _repomem_leakage_filter_enabled() or not CURRENT_INSTANCE:
+        return set(), {}
+    instance_id = CURRENT_INSTANCE.get("instance_id") or CURRENT_ISSUE_ID or ""
+    cache = memory_data.setdefault("_leakage_cache", {})
+    if instance_id in cache:
+        return cache[instance_id]
+
+    issues = memory_data.get("issues") or {}
+    if not issues:
+        cache[instance_id] = (set(), {})
+        return cache[instance_id]
+
+    problem_text = _current_problem_text()
+    problem_tokens = _repomem_overlap_tokens(problem_text)
+    problem_ngrams = _repomem_ngrams(problem_tokens)
+    excluded_issues = {}
+    for issue_number, issue_row in issues.items():
+        overlaps, reason = _issue_overlaps_current(
+            issue_row,
+            problem_tokens=problem_tokens,
+            problem_ngrams=problem_ngrams,
+            problem_text=problem_text,
+        )
+        if overlaps:
+            excluded_issues[str(issue_number)] = reason
+
+    excluded_issue_set = set(excluded_issues)
+    excluded_shas = {
+        row.get("sha")
+        for row in memory_data.get("commits", [])
+        if excluded_issue_set & {str(ref) for ref in row.get("issue_refs", [])}
+    }
+    excluded_shas.discard(None)
+    cache[instance_id] = (excluded_shas, excluded_issues)
+    return cache[instance_id]
+
+
+def _bm25_corpus_stats(rows):
+    doc_freq = collections.Counter()
+    total_len = 0
+    for row in rows:
+        total_len += row.get("_doc_len", 0)
+        for tok in set(row.get("_tokens", [])):
+            doc_freq[tok] += 1
+    avg_doc_len = total_len / len(rows) if rows else 0.0
+    return doc_freq, avg_doc_len
+
+
+def _bm25_score(query_tokens, row, doc_freq, num_docs, avg_doc_len):
+    if not query_tokens or not row.get("_tokens"):
+        return 0.0
+    k1 = 1.5
+    b = 0.75
+    score = 0.0
+    counts = row["_token_counts"]
+    doc_len = max(row["_doc_len"], 1)
+    for tok in query_tokens:
+        tf = counts.get(tok, 0)
+        if not tf:
+            continue
+        df = doc_freq.get(tok, 0)
+        idf = math.log(1 + (num_docs - df + 0.5) / (df + 0.5))
+        denom = tf + k1 * (1 - b + b * doc_len / max(avg_doc_len, 1.0))
+        score += idf * (tf * (k1 + 1)) / denom
+    return score
+
+
+def _read_history_patch(memory_data, sha, max_chars=None, row=None):
+    if max_chars is None:
+        max_chars = _repomem_patch_max_chars()
+    if row and row.get("patch_path"):
+        patch_path = os.path.join(memory_data.get("index_repo_dir", ""), row["patch_path"])
+        if os.path.exists(patch_path):
+            with open(patch_path, encoding="utf-8", errors="replace") as f:
+                patch = f.read().strip()
+            if len(patch) > max_chars:
+                patch = patch[:max_chars] + "\n...[patch truncated]..."
+            return patch
+
+    repo_dir = memory_data["meta"].get("repo_dir")
+    if not repo_dir or not os.path.isdir(repo_dir):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_dir, "show", "--format=", "--no-ext-diff", "--unified=20", sha],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
+    except Exception as exc:
+        return f"[failed to read patch: {exc}]"
+    patch = proc.stdout.strip()
+    if len(patch) > max_chars:
+        patch = patch[:max_chars] + "\n...[patch truncated]..."
+    return patch
 
 def set_current_issue(instance_id: str = None, 
                       instance_data: dict = None,
@@ -1065,9 +1356,160 @@ def explore_tree_structure(
     return rtn_str.strip()
 
 
+def search_commit(query_list: List[str], top_k: int = 20):
+    """Search historical commits in the current repository memory.
+
+    The query should usually be a hypothetical commit message describing the
+    current issue or a likely past fix. Results are restricted to the recent
+    commit window before the current issue's base commit.
+
+    Args:
+        query_list: A list of natural-language or code-keyword queries.
+        top_k: Maximum number of commits returned across all queries.
+
+    Returns:
+        A text report containing short SHAs, commit messages, edited files, and scores.
+    """
+    if not CURRENT_INSTANCE:
+        return "RepoMem is unavailable because no current issue is set."
+
+    repo_name = CURRENT_INSTANCE.get("repo")
+    memory_data = _load_repomem_repo(repo_name)
+    if not memory_data:
+        return (
+            "RepoMem episodic memory is unavailable. Set REPOMEM_INDEX_DIR and "
+            f"build an index for repo `{repo_name}`."
+        )
+
+    if isinstance(query_list, str):
+        query_list = [query_list]
+    top_k = max(1, min(int(top_k or 20), 20))
+
+    visible = list(_iter_visible_commits(memory_data))
+    num_docs = len(visible)
+    if not visible:
+        return "No historical commits are visible before the current base commit."
+
+    doc_freq, avg_doc_len = _bm25_corpus_stats(visible)
+    sections = []
+    seen = set()
+    for query in query_list[:3]:
+        sections.append(f"##Searching for query `{query}`...")
+        scored = []
+        q_tokens = _repomem_tokenize(query)
+        for row in visible:
+            score = _bm25_score(
+                q_tokens,
+                row,
+                doc_freq,
+                num_docs,
+                avg_doc_len,
+            )
+            if score <= 0:
+                continue
+            scored.append((score, row))
+
+        ranked = sorted(scored, key=lambda x: x[0], reverse=True)[:top_k]
+        if not ranked:
+            sections.append("No matching historical commits found.")
+            continue
+
+        sections.append("### Search Result:")
+        for score, row in ranked:
+            seen.add(row["sha"])
+            files = [p for p in row.get("changed_files", []) if p.endswith(".py")]
+            if not files:
+                files = row.get("changed_files", [])[:8]
+            sections.append(
+                f"SHA: {row['short_sha']} | Commit message: {row.get('subject', '').strip()} "
+                f"| Edited files: {files[:12]} | score: {score:.3f}"
+            )
+    if not seen:
+        return "\n".join(sections) if sections else "No matching historical commits found."
+    return "\n".join(sections)
+
+
+def examine_commit(sha_list: List[str], display_issue: bool = False, display_patch: bool = True):
+    """Examine historical commits from repository memory.
+
+    Args:
+        sha_list: A list of full or short commit SHAs returned by search_commit.
+        display_issue: Whether to include linked issue information when available.
+        display_patch: Backward-compatible option. Patches are included by default.
+
+    Returns:
+        A text report with commit messages, edited files, and optional patches.
+    """
+    if not CURRENT_INSTANCE:
+        return "RepoMem is unavailable because no current issue is set."
+
+    repo_name = CURRENT_INSTANCE.get("repo")
+    memory_data = _load_repomem_repo(repo_name)
+    if not memory_data:
+        return (
+            "RepoMem episodic memory is unavailable. Set REPOMEM_INDEX_DIR and "
+            f"build an index for repo `{repo_name}`."
+        )
+
+    if isinstance(sha_list, str):
+        sha_list = [sha_list]
+    visible = list(_iter_visible_commits(memory_data))
+    by_sha = {row["sha"]: row for row in visible}
+
+    lines = []
+    for wanted in sha_list[:10]:
+        matches = [row for sha, row in by_sha.items() if sha.startswith(wanted)]
+        if not matches:
+            lines.append(f"Commit `{wanted}` was not found in visible history.")
+            continue
+        row = matches[0]
+        lines.append(f"##Commit for sha `{row['short_sha']}`...")
+        if display_issue:
+            issue_refs = row.get("issue_refs") or []
+            issue_rows = [
+                memory_data.get("issues", {}).get(str(ref))
+                for ref in issue_refs
+                if memory_data.get("issues", {}).get(str(ref))
+            ]
+            if issue_rows:
+                for issue_row in issue_rows[:3]:
+                    summary = issue_row.get("issue_summary", "").strip()
+                    description = issue_row.get("issue_description", "").strip()
+                    if summary:
+                        lines.append(f"issue summary:\n{summary}")
+                    if description:
+                        lines.append(f"issue description:\n{description}")
+                    if not summary and not description:
+                        lines.append(
+                            f"linked issue id: #{issue_row.get('issue_number')}\n"
+                            "issue description: unavailable in the local episodic index"
+                        )
+            elif row.get("issue_summary") or row.get("issue_description"):
+                lines.append(f"issue summary:\n{row.get('issue_summary', '').strip()}")
+                lines.append(f"issue description:\n{row.get('issue_description', '').strip()}")
+            elif issue_refs:
+                lines.append(
+                    "linked issue ids: "
+                    + ", ".join(f"#{ref}" for ref in issue_refs)
+                    + "\nissue description: unavailable in the local episodic index"
+                )
+        lines.append(
+            f"Commit message: {row.get('subject', '').strip()}\n"
+            f"Edited files: {row.get('changed_files', [])}"
+        )
+        if display_patch:
+            patch = row.get("patch") or _read_history_patch(memory_data, row["sha"], row=row)
+            patch = patch.strip()
+            if patch:
+                lines.append("Patch:\n" + patch)
+    return "\n\n".join(lines) if lines else "No commits requested."
+
+
 __all__ = [
     # 'get_entity_contents',
     'search_code_snippets',
     'explore_graph_structure',
     'explore_tree_structure',
+    'search_commit',
+    'examine_commit',
 ]

@@ -83,7 +83,13 @@ def filter_dataset(dataset, filter_column: str, used_list: str, used_list_file: 
     return dataset
 
 
-def get_task_instruction(instance: dict, task: str = 'auto_search', include_pr=False, include_hint=False):
+def get_task_instruction(
+        instance: dict,
+        task: str = 'auto_search',
+        include_pr=False,
+        include_hint=False,
+        repomem_mode: str = None,
+):
     output_format = None
     instruction = ""
     
@@ -117,6 +123,14 @@ def get_task_instruction(instance: dict, task: str = 'auto_search', include_pr=F
             'IMPORTANT: You should ONLY interact with the environment provided to you AND NEVER ASK FOR HUMAN HELP.\n'
             'Don\'t include any lambda functions!\n'
             'You should NOT modify any files!\n'
+        )
+
+    if repomem_mode in ('episodic', 'both'):
+        instruction += (
+            '\nRepository memory is available through SearchCommit and ExamineCommit tools. '
+            'Use SearchCommit early with issue-specific queries to find related historical fixes, '
+            'then use ExamineCommit on promising commits before deciding final locations. '
+            'Historical patches are hints only; verify candidate files in the current codebase with the normal code tools.\n'
         )
 
     # NOTE: You can actually set slightly different instruction for different task
@@ -240,7 +254,7 @@ def auto_search_process(result_queue,
                 continue 
                 
         last_message = response.choices[0].message.content
-        print(response.choices[0].message)
+        logging.debug(response.choices[0].message)
         messages.append(convert_to_json(raw_response.choices[0].message))
         traj_msgs.append(convert_to_json(raw_response.choices[0].message))
         prompt_tokens += response.usage.prompt_tokens
@@ -388,7 +402,12 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
                     logger.info(f"==== {instance_id} start auto search ====")
                     messages.append({
                         "role": "user",
-                        "content": get_task_instruction(bug, include_pr=True, include_hint=True),
+                        "content": get_task_instruction(
+                            bug,
+                            include_pr=True,
+                            include_hint=True,
+                            repomem_mode=args.repomem_mode if args.use_repomem else None,
+                        ),
                     })
                     
                     ctx = mp.get_context('fork')  # use fork to inherit context!!
@@ -399,6 +418,7 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
                             codeact_enable_search_keyword=True,
                             codeact_enable_search_entity=True,
                             codeact_enable_tree_structure_traverser=True,
+                            codeact_enable_repomem_episodic=args.use_repomem and args.repomem_mode in ('episodic', 'both'),
                             simple_desc = args.simple_desc,
                         )
                     process = ctx.Process(target=auto_search_process, kwargs={
@@ -642,6 +662,11 @@ def main():
     )
     parser.add_argument("--use_function_calling", action="store_true",
                         help='Enable function calling features of LLMs. If disabled, codeact will be used to support function calling.')
+    parser.add_argument("--use_repomem", action="store_true",
+                        help="Enable RepoMem memory tools.")
+    parser.add_argument("--repomem_mode", type=str, default="episodic",
+                        choices=["episodic", "semantic", "both"],
+                        help="RepoMem memory variant to expose to the agent.")
     parser.add_argument("--simple_desc", action="store_true", 
                         help="Use simplified function descriptions due to certain LLM limitations. Set to False for better performance when using Claude.")
     
