@@ -53,6 +53,7 @@ DP_GRAPH: nx.MultiDiGraph | None = None
 
 REPO_SAVE_DIR: str | None = None
 REPOMEM_CACHE: dict = {}
+REPOMEM_SEMANTIC_CACHE: dict = {}
 
 
 def _repomem_repo_key(repo_name: str) -> str:
@@ -86,15 +87,53 @@ def _repomem_commit_window_size():
 
 
 def _repomem_patch_max_chars():
-    value = os.environ.get("REPOMEM_PATCH_MAX_CHARS", "12000")
+    value = os.environ.get("REPOMEM_PATCH_MAX_CHARS", "4000")
     try:
         return max(1000, int(value))
     except ValueError:
-        return 12000
+        return 4000
+
+
+def _repomem_search_commit_topk_cap():
+    value = os.environ.get("REPOMEM_SEARCH_COMMIT_TOPK_CAP", "5")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 5
+
+
+def _repomem_examine_max_commits():
+    value = os.environ.get("REPOMEM_EXAMINE_MAX_COMMITS", "3")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 3
+
+
+def _repomem_issue_max_chars():
+    value = os.environ.get("REPOMEM_ISSUE_MAX_CHARS", "1200")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 1200
+
+
+def _truncate_repomem_text(text, max_chars, label):
+    text = (text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + f"\n...[{label} truncated]..."
 
 
 def _get_repomem_index_dir():
     index_dir = os.environ.get("REPOMEM_INDEX_DIR")
+    if not index_dir:
+        return None
+    return index_dir
+
+
+def _get_repomem_semantic_index_dir():
+    index_dir = os.environ.get("REPOMEM_SEMANTIC_INDEX_DIR")
     if not index_dir:
         return None
     return index_dir
@@ -145,6 +184,48 @@ def _load_repomem_repo(repo_name: str):
         "_leakage_cache": {},
     }
     REPOMEM_CACHE[cache_key] = data
+    return data
+
+
+def _load_repomem_semantic_repo(repo_name: str):
+    index_dir = _get_repomem_semantic_index_dir()
+    if not index_dir:
+        return None
+
+    cache_key = (index_dir, repo_name)
+    if cache_key in REPOMEM_SEMANTIC_CACHE:
+        return REPOMEM_SEMANTIC_CACHE[cache_key]
+
+    repo_dir = os.path.join(index_dir, _repomem_repo_key(repo_name))
+    summaries_path = os.path.join(repo_dir, "summaries.jsonl")
+    meta_path = os.path.join(repo_dir, "meta.json")
+    if not os.path.exists(summaries_path) or not os.path.exists(meta_path):
+        return None
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    summaries = []
+    by_file = {}
+    for line in open(summaries_path, encoding="utf-8"):
+        row = json.loads(line)
+        summary = row.get("summary", "") or ""
+        text = " ".join([row.get("file", ""), summary])
+        tokens = _repomem_tokenize(text)
+        row["_tokens"] = tokens
+        row["_token_counts"] = collections.Counter(tokens)
+        row["_doc_len"] = len(tokens)
+        summaries.append(row)
+        if row.get("file"):
+            by_file[row["file"]] = row
+
+    data = {
+        "meta": meta,
+        "summaries": summaries,
+        "by_file": by_file,
+        "index_repo_dir": repo_dir,
+    }
+    REPOMEM_SEMANTIC_CACHE[cache_key] = data
     return data
 
 
@@ -1383,7 +1464,12 @@ def search_commit(query_list: List[str], top_k: int = 20):
 
     if isinstance(query_list, str):
         query_list = [query_list]
-    top_k = max(1, min(int(top_k or 20), 20))
+    try:
+        requested_top_k = int(top_k or 20)
+    except (TypeError, ValueError):
+        requested_top_k = 20
+    top_k_cap = _repomem_search_commit_topk_cap()
+    top_k = max(1, min(requested_top_k, top_k_cap))
 
     visible = list(_iter_visible_commits(memory_data))
     num_docs = len(visible)
@@ -1393,6 +1479,11 @@ def search_commit(query_list: List[str], top_k: int = 20):
     doc_freq, avg_doc_len = _bm25_corpus_stats(visible)
     sections = []
     seen = set()
+    if requested_top_k > top_k:
+        sections.append(
+            f"SearchCommit top_k was capped from {requested_top_k} to {top_k} "
+            "to keep memory observations concise."
+        )
     for query in query_list[:3]:
         sections.append(f"##Searching for query `{query}`...")
         scored = []
@@ -1453,11 +1544,20 @@ def examine_commit(sha_list: List[str], display_issue: bool = False, display_pat
 
     if isinstance(sha_list, str):
         sha_list = [sha_list]
+    requested_sha_count = len(sha_list)
+    max_commits = _repomem_examine_max_commits()
+    sha_list = sha_list[:max_commits]
     visible = list(_iter_visible_commits(memory_data))
     by_sha = {row["sha"]: row for row in visible}
 
     lines = []
-    for wanted in sha_list[:10]:
+    if requested_sha_count > len(sha_list):
+        lines.append(
+            f"ExamineCommit commit list was capped from {requested_sha_count} "
+            f"to {len(sha_list)} to keep memory observations concise."
+        )
+    issue_max_chars = _repomem_issue_max_chars()
+    for wanted in sha_list:
         matches = [row for sha, row in by_sha.items() if sha.startswith(wanted)]
         if not matches:
             lines.append(f"Commit `{wanted}` was not found in visible history.")
@@ -1473,8 +1573,16 @@ def examine_commit(sha_list: List[str], display_issue: bool = False, display_pat
             ]
             if issue_rows:
                 for issue_row in issue_rows[:3]:
-                    summary = issue_row.get("issue_summary", "").strip()
-                    description = issue_row.get("issue_description", "").strip()
+                    summary = _truncate_repomem_text(
+                        issue_row.get("issue_summary", ""),
+                        min(issue_max_chars, 500) if issue_max_chars else 0,
+                        "issue summary",
+                    )
+                    description = _truncate_repomem_text(
+                        issue_row.get("issue_description", ""),
+                        issue_max_chars,
+                        "issue description",
+                    )
                     if summary:
                         lines.append(f"issue summary:\n{summary}")
                     if description:
@@ -1485,8 +1593,20 @@ def examine_commit(sha_list: List[str], display_issue: bool = False, display_pat
                             "issue description: unavailable in the local episodic index"
                         )
             elif row.get("issue_summary") or row.get("issue_description"):
-                lines.append(f"issue summary:\n{row.get('issue_summary', '').strip()}")
-                lines.append(f"issue description:\n{row.get('issue_description', '').strip()}")
+                summary = _truncate_repomem_text(
+                    row.get("issue_summary", ""),
+                    min(issue_max_chars, 500) if issue_max_chars else 0,
+                    "issue summary",
+                )
+                description = _truncate_repomem_text(
+                    row.get("issue_description", ""),
+                    issue_max_chars,
+                    "issue description",
+                )
+                if summary:
+                    lines.append(f"issue summary:\n{summary}")
+                if description:
+                    lines.append(f"issue description:\n{description}")
             elif issue_refs:
                 lines.append(
                     "linked issue ids: "
@@ -1494,7 +1614,7 @@ def examine_commit(sha_list: List[str], display_issue: bool = False, display_pat
                     + "\nissue description: unavailable in the local episodic index"
                 )
         lines.append(
-            f"Commit message: {row.get('subject', '').strip()}\n"
+            f"Commit message: {_truncate_repomem_text(row.get('subject', ''), 500, 'commit message')}\n"
             f"Edited files: {row.get('changed_files', [])}"
         )
         if display_patch:
@@ -1505,6 +1625,98 @@ def examine_commit(sha_list: List[str], display_issue: bool = False, display_pat
     return "\n\n".join(lines) if lines else "No commits requested."
 
 
+def _match_summary_file(file_name: str, semantic_data):
+    query = (file_name or "").strip().strip("`'\"")
+    if not query:
+        return None, []
+    query = query.replace("\\", "/")
+    for prefix in ("./", "a/", "b/"):
+        if query.startswith(prefix):
+            query = query[len(prefix):]
+
+    by_file = semantic_data.get("by_file", {})
+    if query in by_file:
+        return by_file[query], []
+
+    matches = [
+        row for path, row in by_file.items()
+        if path.endswith("/" + query) or path.endswith(query)
+    ]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, [row.get("file", "") for row in matches[:10]]
+
+
+def view_summary(file_name: str):
+    """View a cached functionality summary for a repository file."""
+    if not CURRENT_INSTANCE:
+        return "RepoMem semantic memory is unavailable because no current issue is set."
+
+    repo_name = CURRENT_INSTANCE.get("repo")
+    semantic_data = _load_repomem_semantic_repo(repo_name)
+    if not semantic_data:
+        return (
+            "RepoMem semantic memory is unavailable. Set REPOMEM_SEMANTIC_INDEX_DIR "
+            f"and build a semantic index for repo `{repo_name}`."
+        )
+
+    row, ambiguous = _match_summary_file(file_name, semantic_data)
+    if not row:
+        if ambiguous:
+            return (
+                f"Multiple cached summaries match `{file_name}`. "
+                f"Use a more specific path. Matches: {ambiguous}"
+            )
+        return f"No cached summary found for `{file_name}`."
+
+    return (
+        f"file: {row.get('file')}\n"
+        f"edit_count: {row.get('edit_count', 'unknown')}\n"
+        f"summary: {row.get('summary', '').strip()}"
+    ).strip()
+
+
+def search_summary(query: str, top_k: int = 5):
+    """Search cached repository file summaries with BM25."""
+    if not CURRENT_INSTANCE:
+        return "RepoMem semantic memory is unavailable because no current issue is set."
+
+    repo_name = CURRENT_INSTANCE.get("repo")
+    semantic_data = _load_repomem_semantic_repo(repo_name)
+    if not semantic_data:
+        return (
+            "RepoMem semantic memory is unavailable. Set REPOMEM_SEMANTIC_INDEX_DIR "
+            f"and build a semantic index for repo `{repo_name}`."
+        )
+
+    summaries = semantic_data.get("summaries") or []
+    if not summaries:
+        return "No cached file summaries are available in semantic memory."
+
+    top_k = max(1, min(int(top_k or 5), 10))
+    query = query or ""
+    q_tokens = _repomem_tokenize(query)
+    doc_freq, avg_doc_len = _bm25_corpus_stats(summaries)
+    scored = []
+    for row in summaries:
+        score = _bm25_score(q_tokens, row, doc_freq, len(summaries), avg_doc_len)
+        if score > 0:
+            scored.append((score, row))
+
+    lines = [f"## Searching for query `{query}`..."]
+    if not scored:
+        lines.append("No matching file summaries found.")
+        return "\n".join(lines)
+
+    lines.append("### Search Result:")
+    for score, row in sorted(scored, key=lambda x: x[0], reverse=True)[:top_k]:
+        summary = (row.get("summary", "") or "").strip()
+        lines.append(
+            f"file: {row.get('file')} | summary: {summary} | score: {score:.3f}"
+        )
+    return "\n".join(lines)
+
+
 __all__ = [
     # 'get_entity_contents',
     'search_code_snippets',
@@ -1512,4 +1724,6 @@ __all__ = [
     'explore_tree_structure',
     'search_commit',
     'examine_commit',
+    'view_summary',
+    'search_summary',
 ]

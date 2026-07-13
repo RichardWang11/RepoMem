@@ -1,4 +1,5 @@
 import argparse
+import ast
 import os
 import json
 import logging
@@ -49,6 +50,23 @@ from util.runtime.fn_call_converter import (
 )
 # litellm.set_verbose=True
 # os.environ['LITELLM_LOG'] = 'DEBUG
+
+
+def normalize_function_response(function_response):
+    if function_response is None:
+        return ""
+
+    if isinstance(function_response, str):
+        try:
+            parsed_response = ast.literal_eval(function_response)
+        except (SyntaxError, ValueError, TypeError):
+            return function_response
+    else:
+        parsed_response = function_response
+
+    if isinstance(parsed_response, str):
+        return parsed_response
+    return str(parsed_response)
 
 
 def filter_dataset(dataset, filter_column: str, used_list: str, used_list_file: str = None):
@@ -131,6 +149,13 @@ def get_task_instruction(
             'Use SearchCommit early with issue-specific queries to find related historical fixes, '
             'then use ExamineCommit on promising commits before deciding final locations. '
             'Historical patches are hints only; verify candidate files in the current codebase with the normal code tools.\n'
+        )
+    if repomem_mode in ('semantic', 'both'):
+        instruction += (
+            '\nRepository semantic memory is available through SearchSummary and ViewSummary tools. '
+            'Use SearchSummary with issue-specific functionality queries to find actively edited files with relevant cached summaries, '
+            'then use ViewSummary for candidate files when a compact functionality overview is useful. '
+            'File summaries are hints only; verify final candidate files in the current codebase with the normal code tools.\n'
         )
 
     # NOTE: You can actually set slightly different instruction for different task
@@ -288,15 +313,7 @@ def auto_search_process(result_queue,
                 ipython_code = action.code.strip('`')
                 logging.info(f"Executing code:\n```\n{ipython_code}\n```")
                 function_response = execute_ipython(ipython_code)
-                if function_response is None:
-                    function_response = ''
-                else:
-                    try:
-                        function_response = eval(function_response)
-                    except (SyntaxError, TypeError):
-                        function_response = function_response
-                    if not isinstance(function_response, str):
-                        function_response = str(function_response)
+                function_response = normalize_function_response(function_response)
                 
                 logging.info("OBSERVATION:\n" + function_response)
                 if not tools:
@@ -419,6 +436,7 @@ def run_localize(rank, args, bug_queue, log_queue, output_file_lock, traj_file_l
                             codeact_enable_search_entity=True,
                             codeact_enable_tree_structure_traverser=True,
                             codeact_enable_repomem_episodic=args.use_repomem and args.repomem_mode in ('episodic', 'both'),
+                            codeact_enable_repomem_semantic=args.use_repomem and args.repomem_mode in ('semantic', 'both'),
                             simple_desc = args.simple_desc,
                         )
                     process = ctx.Process(target=auto_search_process, kwargs={

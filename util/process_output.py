@@ -25,6 +25,7 @@ def parse_raw_loc_output(raw_output, valid_files):
     # Remove the triple backticks and any surrounding whitespace
     raw_output = raw_output.strip('` \n')
     file_list, loc_edit_list = [], []
+    valid_file_set = set(valid_files)
     
     current_file = None
     # Split the input data into lines
@@ -36,7 +37,7 @@ def parse_raw_loc_output(raw_output, valid_files):
 
         if line.endswith('.py'):
             fn = extract_python_file_path(line, valid_top_folder)
-            if not fn or fn not in valid_files:
+            if not fn or fn not in valid_file_set:
                 current_file = None
                 continue
 
@@ -54,6 +55,11 @@ def parse_raw_loc_output(raw_output, valid_files):
                 loc_edit_list.append(loc)
             # if current_file and line not in loc_edit_dict[current_file]:
             #     loc_edit_dict[current_file].append(line)
+
+    for matched_fp in re.findall(r'[\w\./-]+\.py', raw_output):
+        fn = extract_python_file_path(matched_fp, valid_top_folder)
+        if fn and fn in valid_file_set and fn not in file_list:
+            file_list.append(fn)
 
     return file_list, loc_edit_list
 
