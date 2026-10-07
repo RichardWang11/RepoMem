@@ -1,7 +1,7 @@
 # set api key
 # or set api key in `scripts/env/set_env.sh`
 # . scripts/env/set_env.sh
-export OPENAI_API_KEY="sk-123..."
+export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 export OPENAI_API_BASE="https://XXXXX"
 
 export PYTHONPATH=$PYTHONPATH:$(pwd)

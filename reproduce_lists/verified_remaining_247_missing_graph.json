@@ -1,0 +1,16 @@
+[
+  "matplotlib__matplotlib-13989",
+  "matplotlib__matplotlib-14623",
+  "matplotlib__matplotlib-20676",
+  "matplotlib__matplotlib-22865",
+  "pydata__xarray-3151",
+  "pydata__xarray-3305",
+  "pydata__xarray-3677",
+  "pytest-dev__pytest-5631",
+  "scikit-learn__scikit-learn-11310",
+  "scikit-learn__scikit-learn-12585",
+  "sphinx-doc__sphinx-10323",
+  "sphinx-doc__sphinx-10449",
+  "sphinx-doc__sphinx-10673",
+  "sympy__sympy-13372"
+]

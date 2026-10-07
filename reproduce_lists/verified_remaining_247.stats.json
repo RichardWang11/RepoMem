@@ -1,0 +1,31 @@
+{
+  "total": 500,
+  "existing": 253,
+  "remaining": 247,
+  "remaining_by_repo": {
+    "matplotlib": 34,
+    "mwaskom": 2,
+    "pallets": 1,
+    "psf": 8,
+    "pydata": 22,
+    "pylint-dev": 10,
+    "pytest-dev": 19,
+    "scikit-learn": 32,
+    "sphinx-doc": 44,
+    "sympy": 75
+  },
+  "full_by_repo": {
+    "astropy": 22,
+    "django": 231,
+    "matplotlib": 34,
+    "mwaskom": 2,
+    "pallets": 1,
+    "psf": 8,
+    "pydata": 22,
+    "pylint-dev": 10,
+    "pytest-dev": 19,
+    "scikit-learn": 32,
+    "sphinx-doc": 44,
+    "sympy": 75
+  }
+}

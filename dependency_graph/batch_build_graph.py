@@ -12,6 +12,13 @@ from dependency_graph.build_graph import build_graph, VERSION
 from util.benchmark.setup_repo import setup_repo
 
 
+def load_bench_data(dataset, split):
+    path = Path(dataset)
+    if path.is_file():
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return load_dataset(dataset, split=split)
+
+
 def list_folders(path):
     return [p.name for p in Path(path).iterdir() if p.is_dir()]
 
@@ -66,19 +73,21 @@ if __name__ == '__main__':
                         help='The directory where you plan to pull or have already pulled the codebase.')
     parser.add_argument('--index_dir', type=str, default='index_data', 
                         help='The base directory where the generated graph index will be saved.')
+    parser.add_argument('--output_dir', type=str, default='',
+                        help='Exact output directory; bypasses dataset-derived nesting.')
     parser.add_argument('--instance_id_path', type=str, default='', 
                         help='Path to a file containing a list of selected instance IDs.')
     args = parser.parse_args()
 
     
     dataset_name = args.dataset.split('/')[-1]
-    args.index_dir = f'{args.index_dir}/{dataset_name}/graph_index_{VERSION}/'
+    args.index_dir = args.output_dir or f'{args.index_dir}/{dataset_name}/graph_index_{VERSION}/'
     os.makedirs(args.index_dir, exist_ok=True)
         
     # load selected repo instance id and instance_data
     if args.download_repo:
         selected_instance_data = {}
-        bench_data = load_dataset(args.dataset, split=args.split)
+        bench_data = load_bench_data(args.dataset, args.split)
         if args.instance_id_path and osp.exists(args.instance_id_path):
             with open(args.instance_id_path, 'r') as f:
                 repo_folders = json.loads(f.read())

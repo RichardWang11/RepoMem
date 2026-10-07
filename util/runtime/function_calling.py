@@ -23,6 +23,7 @@ from .memory_tools import (
     ExamineCommitTool,
     ViewSummaryTool,
     SearchSummaryTool,
+    get_memory_tools,
 )
 import logging
 logger = logging.getLogger()
@@ -113,6 +114,7 @@ def get_tools(
         codeact_enable_repomem_episodic: bool = False,
         codeact_enable_repomem_semantic: bool = False,
         simple_desc: bool = False,
+        repomem_tool_profile: str = "current",
         
 ) -> list[ChatCompletionToolParam]:
     tools = [FinishTool]
@@ -127,10 +129,11 @@ def get_tools(
             tools.append(ExploreTreeStructure_simple)
         else:
             tools.append(ExploreTreeStructure)
+    memory_tools = get_memory_tools(repomem_tool_profile)
     if codeact_enable_repomem_episodic:
-        tools.append(SearchCommitTool)
-        tools.append(ExamineCommitTool)
+        tools.append(memory_tools["search_commit"])
+        tools.append(memory_tools["examine_commit"])
     if codeact_enable_repomem_semantic:
-        tools.append(ViewSummaryTool)
-        tools.append(SearchSummaryTool)
+        tools.append(memory_tools["view_summary"])
+        tools.append(memory_tools["search_summary"])
     return tools
